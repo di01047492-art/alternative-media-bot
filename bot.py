@@ -1,906 +1,590 @@
 import os
-import asyncio
 import sqlite3
-import hashlib
-import secrets
-import json
-import re
-from urllib.parse import urlparse
-from collections import defaultdict, deque
-from datetime import datetime, timezone
+import asyncio
+from datetime import datetime
 
 import aiohttp
-import discord
-from discord.ext import commands
-from discord import app_commands
+from aiogram import Bot, Dispatcher, F
+from aiogram.client.default import DefaultBotProperties
+from aiogram.enums import ParseMode
+from aiogram.filters import Command, CommandStart
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
 
-TOKEN = os.getenv("DISCORD_TOKEN")
-DB_FILE = "accounts.db"
+TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+ADMIN_ID_RAW = os.getenv("ADMIN_ID", "").strip()
+ADMIN_ID = int(ADMIN_ID_RAW) if ADMIN_ID_RAW.isdigit() else None
 
-intents = discord.Intents.default()
-intents.guilds = True
-intents.members = True
+DISCORD_BOT_TOKEN = os.getenv("DISCORD_BOT_TOKEN", "").strip()
+DISCORD_GUILD_ID = os.getenv("DISCORD_GUILD_ID", "").strip()
+DISCORD_MEDIA_ROLE_ID = os.getenv("DISCORD_MEDIA_ROLE_ID", "").strip()
 
-bot = commands.Bot(command_prefix="!", intents=intents)
+DB_PATH = os.getenv("DB_PATH", "alternative.db")
 
-# Anti-Nuke
-ANTINUKE_WINDOW = 10
-ANTINUKE_LIMITS = {
-    "channel_delete": 3,
-    "role_delete": 3,
-    "ban": 5,
-    "kick": 5,
-}
-_action_history = defaultdict(lambda: defaultdict(deque))
+if not TOKEN:
+    raise RuntimeError("TELEGRAM_BOT_TOKEN is not set")
 
-async def antinuke_check(guild: discord.Guild, user: discord.Member, action: str):
-    if user.id == guild.owner_id or user.guild_permissions.administrator:
-        return False
-    now = asyncio.get_running_loop().time()
-    q = _action_history[user.id][action]
-    q.append(now)
-    while q and now - q[0] > ANTINUKE_WINDOW:
-        q.popleft()
-    return len(q) >= ANTINUKE_LIMITS.get(action, 999)
+bot = Bot(TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+dp = Dispatcher()
 
-async def antinuke_timeout(guild: discord.Guild, user: discord.Member, action: str):
-    try:
-        await user.timeout(discord.utils.utcnow() + __import__("datetime").timedelta(hours=1),
-                           reason=f"Anti-Nuke: {action}")
-    except Exception:
-        pass
-    try:
-        log = discord.utils.get(guild.text_channels, name="anti-nuke-logs")
-        if log:
-            await log.send(f"🛡️ **Anti-Nuke**: {user.mention} ограничен. Причина: `{action}`.")
-    except Exception:
-        pass
-
-
-TICKET_CATEGORIES = {
-    "tech": ("🛠️", "Technical Support"),
-    "bug": ("🐛", "Bug Report"),
-    "suggest": ("💡", "Suggestion"),
-    "purchase": ("💳", "Purchase"),
-    "partner": ("🤝", "Partnership"),
-    "media": ("🎬", "Media"),
-    "other": ("❓", "Other"),
-}
-
-
-# ---------------- DATABASE ----------------
 
 def db():
-    conn = sqlite3.connect(DB_FILE)
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS accounts (
-            discord_id INTEGER PRIMARY KEY,
-            username TEXT UNIQUE NOT NULL,
-            password_hash TEXT NOT NULL,
-            salt TEXT NOT NULL,
-            created_at TEXT NOT NULL,
-            balance REAL NOT NULL DEFAULT 0
+    return sqlite3.connect(DB_PATH)
+
+
+def init_db():
+    con = db()
+    cur = con.cursor()
+    cur.execute("""CREATE TABLE IF NOT EXISTS users (
+        telegram_id INTEGER PRIMARY KEY,
+        username TEXT,
+        first_name TEXT,
+        discord_id TEXT,
+        role TEXT DEFAULT 'User',
+        balance REAL DEFAULT 0,
+        referral_code TEXT UNIQUE,
+        created_at TEXT
+    )""")
+    cur.execute("""CREATE TABLE IF NOT EXISTS withdrawals (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        telegram_id INTEGER,
+        amount REAL,
+        method TEXT,
+        details TEXT,
+        status TEXT DEFAULT 'pending',
+        created_at TEXT
+    )""")
+    con.commit()
+    con.close()
+
+
+def ensure_user(message: Message):
+    u = message.from_user
+    if not u:
+        return
+    con = db()
+    cur = con.cursor()
+    cur.execute("SELECT telegram_id FROM users WHERE telegram_id=?", (u.id,))
+    if not cur.fetchone():
+        cur.execute(
+            """INSERT INTO users
+            (telegram_id, username, first_name, referral_code, created_at)
+            VALUES (?, ?, ?, ?, ?)""",
+            (u.id, u.username or "", u.first_name or "",
+             f"ALT{u.id}", datetime.utcnow().isoformat())
         )
-    """)
-    cols = [r[1] for r in conn.execute("PRAGMA table_info(accounts)").fetchall()]
-    if "balance" not in cols:
-        conn.execute("ALTER TABLE accounts ADD COLUMN balance REAL NOT NULL DEFAULT 0")
-    conn.commit()
-    return conn
+    else:
+        cur.execute(
+            "UPDATE users SET username=?, first_name=? WHERE telegram_id=?",
+            (u.username or "", u.first_name or "", u.id)
+        )
+    con.commit()
+    con.close()
 
 
-def hash_password(password: str, salt: bytes | None = None):
-    if salt is None:
-        salt = secrets.token_bytes(16)
-    password_hash = hashlib.pbkdf2_hmac(
-        "sha256",
-        password.encode("utf-8"),
-        salt,
-        200_000
-    )
-    return salt.hex(), password_hash.hex()
-
-
-def check_password(password: str, salt_hex: str, stored_hash: str):
-    salt = bytes.fromhex(salt_hex)
-    _, new_hash = hash_password(password, salt)
-    return secrets.compare_digest(new_hash, stored_hash)
-
-
-def get_account(discord_id: int):
-    conn = db()
-    row = conn.execute(
-        "SELECT discord_id, username, password_hash, salt, created_at, balance "
-        "FROM accounts WHERE discord_id = ?",
-        (discord_id,)
+def get_user(tg_id):
+    con = db()
+    row = con.execute(
+        "SELECT * FROM users WHERE telegram_id=?", (tg_id,)
     ).fetchone()
-    conn.close()
+    con.close()
     return row
 
 
-def username_taken(username: str):
-    conn = db()
-    row = conn.execute(
-        "SELECT discord_id FROM accounts WHERE username = ?",
-        (username,)
-    ).fetchone()
-    conn.close()
-    return row is not None
+def set_discord(tg_id, discord_id):
+    con = db()
+    con.execute(
+        "UPDATE users SET discord_id=? WHERE telegram_id=?",
+        (discord_id, tg_id)
+    )
+    con.commit()
+    con.close()
 
 
-def create_account(discord_id: int, username: str, password: str):
-    salt, password_hash = hash_password(password)
-    created_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
+def set_role(tg_id, role):
+    con = db()
+    con.execute(
+        "UPDATE users SET role=? WHERE telegram_id=?",
+        (role, tg_id)
+    )
+    con.commit()
+    con.close()
 
-    conn = db()
+
+def add_balance(tg_id, amount):
+    con = db()
+    con.execute(
+        "UPDATE users SET balance=balance+? WHERE telegram_id=?",
+        (amount, tg_id)
+    )
+    con.commit()
+    con.close()
+
+
+def main_kb():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="👤 Профиль", callback_data="profile"),
+            InlineKeyboardButton(text="💼 Кабинет", callback_data="cabinet"),
+        ],
+        [
+            InlineKeyboardButton(text="🎬 Media", callback_data="media"),
+            InlineKeyboardButton(text="💰 Вывод средств", callback_data="withdraw"),
+        ],
+        [
+            InlineKeyboardButton(text="🎁 Промокод", callback_data="promo"),
+            InlineKeyboardButton(text="👥 Реферальная программа", callback_data="referrals"),
+        ],
+        [
+            InlineKeyboardButton(text="ℹ️ Информация", callback_data="info"),
+            InlineKeyboardButton(text="🆘 Поддержка", callback_data="support"),
+        ],
+    ])
+
+
+def back_kb():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="⬅️ Назад", callback_data="home")]
+    ])
+
+
+def media_kb():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🎬 Подать заявку на Media", callback_data="media_apply")],
+        [InlineKeyboardButton(text="🔗 Привязать Discord", callback_data="discord_link")],
+        [InlineKeyboardButton(text="⬅️ Назад", callback_data="home")]
+    ])
+
+
+def withdraw_kb():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="💳 Создать заявку на вывод", callback_data="withdraw_create")],
+        [InlineKeyboardButton(text="⬅️ Назад", callback_data="home")]
+    ])
+
+
+class Form(StatesGroup):
+    discord = State()
+    media_tiktok = State()
+    promo = State()
+    withdraw_amount = State()
+    withdraw_method = State()
+    withdraw_details = State()
+    support = State()
+
+
+async def check_discord_media_role(discord_id):
+    if not (DISCORD_BOT_TOKEN and DISCORD_GUILD_ID and DISCORD_MEDIA_ROLE_ID):
+        return False, "not_configured"
+
+    url = f"https://discord.com/api/v10/guilds/{DISCORD_GUILD_ID}/members/{discord_id}"
+    headers = {"Authorization": f"Bot {DISCORD_BOT_TOKEN}"}
+
     try:
-        conn.execute(
-            "INSERT INTO accounts "
-            "(discord_id, username, password_hash, salt, created_at) "
-            "VALUES (?, ?, ?, ?, ?)",
-            (discord_id, username, password_hash, salt, created_at)
-        )
-        conn.commit()
-        return True, None
-    except sqlite3.IntegrityError:
-        return False, "Этот логин уже занят или у тебя уже есть аккаунт."
-    finally:
-        conn.close()
-
-
-# ---------------- ACCOUNT MANAGER ----------------
-
-class CreateAccountModal(discord.ui.Modal, title="Создание аккаунта"):
-    username = discord.ui.TextInput(
-        label="Придумай логин",
-        placeholder="Например: Player123",
-        min_length=3,
-        max_length=24,
-        required=True,
-    )
-    password = discord.ui.TextInput(
-        label="Придумай пароль",
-        placeholder="Минимум 6 символов",
-        min_length=6,
-        max_length=128,
-        required=True,
-        style=discord.TextStyle.short,
-    )
-
-    async def on_submit(self, interaction: discord.Interaction):
-        username = str(self.username.value).strip()
-        password = str(self.password.value)
-
-        if not username.replace("_", "").replace("-", "").isalnum():
-            return await interaction.response.send_message(
-                "❌ Используй только буквы, цифры, `_` или `-`.",
-                ephemeral=True
-            )
-
-        if username_taken(username):
-            return await interaction.response.send_message(
-                "❌ Такой логин уже занят. Попробуй другой.",
-                ephemeral=True
-            )
-
-        if get_account(interaction.user.id):
-            return await interaction.response.send_message(
-                "❌ У тебя уже есть аккаунт.",
-                ephemeral=True
-            )
-
-        ok, error = create_account(interaction.user.id, username, password)
-
-        if not ok:
-            return await interaction.response.send_message(
-                f"❌ {error}",
-                ephemeral=True
-            )
-
-        await interaction.response.send_message(
-            f"✅ Аккаунт создан!\\n"
-            f"Логин: `{username}`\\n\\n"
-            f"Пароль сохранён в защищённом виде.",
-            ephemeral=True
-        )
-
-
-class AccountInfoView(discord.ui.View):
-    def __init__(self):
-        super().__init__(timeout=None)
-
-    @discord.ui.button(
-        label="Создать аккаунт",
-        emoji="📝",
-        style=discord.ButtonStyle.success,
-        custom_id="account:create"
-    )
-    async def create(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if get_account(interaction.user.id):
-            return await interaction.response.send_message(
-                "❌ У тебя уже есть аккаунт. Нажми «Мой аккаунт».",
-                ephemeral=True
-            )
-        await interaction.response.send_modal(CreateAccountModal())
-
-    @discord.ui.button(
-        label="Мой аккаунт",
-        emoji="👤",
-        style=discord.ButtonStyle.primary,
-        custom_id="account:info"
-    )
-    async def info(self, interaction: discord.Interaction, button: discord.ui.Button):
-        account = get_account(interaction.user.id)
-
-        if not account:
-            return await interaction.response.send_message(
-                "❌ Аккаунта ещё нет. Нажми «Создать аккаунт».",
-                ephemeral=True
-            )
-
-        _, username, _, _, created_at, balance = account
-
-        role_names = {
-            "User",
-            "Media",
-            "Owner",
-            "Developer",
-            "Ticket helper",
-            "Moderator",
-        }
-        user_roles = [
-            role.name
-            for role in interaction.user.roles
-            if role.name in role_names
-        ]
-        roles_text = ", ".join(user_roles) if user_roles else "Нет"
-
-        embed = discord.Embed(
-            title="👤 Сведения об аккаунте",
-            color=discord.Color.blurple()
-        )
-        embed.add_field(name="Логин", value=f"`{username}`", inline=False)
-        embed.add_field(name="Discord ID", value=f"`{interaction.user.id}`", inline=False)
-        embed.add_field(name="Роль", value=roles_text, inline=False)
-        embed.add_field(name="Баланс", value=f"`{balance:.2f} ₽`", inline=False)
-        embed.add_field(name="Создан", value=f"`{created_at}`", inline=False)
-        embed.add_field(
-            name="Пароль",
-            value="🔒 Не показывается и не хранится в открытом виде.",
-            inline=False
-        )
-
-        await interaction.response.send_message(embed=embed, ephemeral=True)
-
-
-# ---------------- TICKETS ----------------
-
-def is_ticket_helper(member: discord.Member) -> bool:
-    return any(r.name.lower() == "ticket helper" for r in member.roles)
-
-def can_manage_ticket(member: discord.Member) -> bool:
-    return (
-        member.guild_permissions.manage_channels
-        or member.guild_permissions.administrator
-        or is_ticket_helper(member)
-    )
-
-
-class CloseView(discord.ui.View):
-    def __init__(self):
-        super().__init__(timeout=None)
-
-    @discord.ui.button(
-        label="Закрыть тикет",
-        emoji="🔒",
-        style=discord.ButtonStyle.danger,
-        custom_id="ticket:close"
-    )
-    async def close(self, interaction: discord.Interaction, button: discord.ui.Button):
-        topic = interaction.channel.topic or ""
-        owner_id = topic.removeprefix("alternative-ticket:").split(":", 1)[0]
-
-        if not can_manage_ticket(interaction.user) and str(interaction.user.id) != owner_id:
-            return await interaction.response.send_message(
-                "❌ Закрыть тикет может только автор или staff.",
-                ephemeral=True
-            )
-
-        await interaction.response.send_message("🔒 Тикет закрывается...")
-        await asyncio.sleep(2)
-        await interaction.channel.delete(
-            reason=f"Ticket closed by {interaction.user}"
-        )
-
-
-class TicketSelect(discord.ui.Select):
-    def __init__(self):
-        options = [
-            discord.SelectOption(
-                label=name,
-                emoji=emoji,
-                value=value
-            )
-            for value, (emoji, name) in TICKET_CATEGORIES.items()
-        ]
-
-        super().__init__(
-            placeholder="Выберите категорию тикета...",
-            options=options,
-            custom_id="ticket:category"
-        )
-
-    async def callback(self, interaction: discord.Interaction):
-        guild = interaction.guild
-        user = interaction.user
-
-        for channel in guild.text_channels:
-            if (channel.topic or "").startswith(
-                f"alternative-ticket:{user.id}:"
-            ):
-                return await interaction.response.send_message(
-                    f"❌ У тебя уже есть открытый тикет: {channel.mention}",
-                    ephemeral=True
-                )
-
-        emoji, category_name = TICKET_CATEGORIES[self.values[0]]
-
-        category = discord.utils.get(
-            guild.categories,
-            name="🎫 TICKETS"
-        )
-
-        if category is None:
-            try:
-                category = await guild.create_category(
-                    "🎫 TICKETS",
-                    reason="Ticket system"
-                )
-            except discord.Forbidden:
-                return await interaction.response.send_message(
-                    "❌ Боту нужно право Manage Channels.",
-                    ephemeral=True
-                )
-
-        overwrites = {
-            guild.default_role: discord.PermissionOverwrite(
-                view_channel=False
-            ),
-            user: discord.PermissionOverwrite(
-                view_channel=True,
-                send_messages=True,
-                read_message_history=True,
-                attach_files=True
-            ),
-            guild.me: discord.PermissionOverwrite(
-                view_channel=True,
-                send_messages=True,
-                read_message_history=True,
-                manage_channels=True,
-                manage_messages=True
-            ),
-        }
-
-        # Роль Ticket Helper автоматически получает доступ к тикетам.
-        helper_role = next((r for r in guild.roles if r.name.lower() == "ticket helper"), None)
-        if helper_role:
-            overwrites[helper_role] = discord.PermissionOverwrite(
-                view_channel=True,
-                send_messages=True,
-                read_message_history=True,
-                attach_files=True
-            )
-
-        safe_name = "".join(
-            c if c.isalnum() or c in "-_" else "-"
-            for c in user.name.lower()
-        ).strip("-")[:60]
-
-        channel_name = f"ticket-{safe_name or 'user'}"
-
-        try:
-            channel = await guild.create_text_channel(
-                name=channel_name,
-                category=category,
-                topic=f"alternative-ticket:{user.id}:{self.values[0]}",
-                overwrites=overwrites,
-                reason=f"Ticket: {category_name}"
-            )
-        except discord.Forbidden:
-            return await interaction.response.send_message(
-                "❌ Не хватает прав. Дай боту Manage Channels.",
-                ephemeral=True
-            )
-
-        embed = discord.Embed(
-            title=f"{emoji} {category_name}",
-            description=(
-                f"Привет, {user.mention}!\n\n"
-                "Опиши вопрос подробно и приложи нужные файлы/скриншоты.\n\n"
-                "Когда всё решено, нажми **🔒 Закрыть тикет**."
-            ),
-            color=discord.Color.blurple()
-        )
-        embed.set_footer(text="Alternative Client • Support")
-
-        await channel.send(
-            content=user.mention,
-            embed=embed,
-            view=CloseView()
-        )
-
-        await interaction.response.send_message(
-            f"✅ Тикет создан: {channel.mention}",
-            ephemeral=True
-        )
-
-
-class TicketPanel(discord.ui.View):
-    def __init__(self):
-        super().__init__(timeout=None)
-        self.add_item(TicketSelect())
-
-
-
-# ---------------- MEDIA / FAQ / BALANCE ----------------
-
-MEDIA_ROLE_NAMES = {"media": "Media", "media+": "Media+"}
-
-def find_role(guild: discord.Guild, name: str):
-    return discord.utils.find(lambda r: r.name.lower() == name.lower(), guild.roles)
-
-def account_balance(user_id: int) -> float:
-    account = get_account(user_id)
-    return float(account[5]) if account else 0.0
-
-def add_balance(user_id: int, amount: float):
-    conn = db()
-    conn.execute("UPDATE accounts SET balance = COALESCE(balance, 0) + ? WHERE discord_id = ?", (amount, user_id))
-    conn.commit()
-    conn.close()
-
-async def fetch_tiktok_views(profile_url: str):
-    """Best-effort public-page check. TikTok can block automated requests, so None means manual review."""
-    parsed = urlparse(profile_url)
-    if parsed.scheme not in {"http", "https"} or "tiktok.com" not in parsed.netloc.lower():
-        return None
-    headers = {
-        "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 Version/17.0 Mobile/15E148 Safari/604.1"
-    }
-    try:
-        timeout = aiohttp.ClientTimeout(total=15)
-        async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
-            async with session.get(profile_url, allow_redirects=True) as resp:
+        timeout = aiohttp.ClientTimeout(total=10)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.get(url, headers=headers) as resp:
+                if resp.status == 404:
+                    return False, "not_found"
                 if resp.status != 200:
-                    return None
-                html = await resp.text(errors="ignore")
-        # Public TikTok pages often contain playCount/play_count in embedded JSON.
-        raw = re.findall(r'"(?:playCount|play_count)"\s*:\s*(\d+)', html)
-        views = []
-        for x in raw:
-            n = int(x)
-            if n not in views:
-                views.append(n)
-        views.sort(reverse=True)
-        return views[:20] if len(views) >= 3 else None
+                    return False, f"http_{resp.status}"
+                data = await resp.json()
+                roles = {str(x) for x in data.get("roles", [])}
+                return DISCORD_MEDIA_ROLE_ID in roles, "ok"
     except Exception:
-        return None
+        return False, "error"
 
-async def create_media_ticket(guild: discord.Guild, user: discord.Member, profile_url: str, paid: bool, payment_method: str = ""):
-    category = discord.utils.get(guild.categories, name="🎫 TICKETS")
-    if category is None:
-        category = await guild.create_category("🎫 TICKETS", reason="Media application")
-    helper_role = next((r for r in guild.roles if r.name.lower() == "ticket helper"), None)
-    overwrites = {
-        guild.default_role: discord.PermissionOverwrite(view_channel=False),
-        user: discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True, attach_files=True),
-        guild.me: discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True, manage_channels=True, manage_messages=True),
-    }
-    if helper_role:
-        overwrites[helper_role] = discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True, attach_files=True)
-    safe = "".join(c if c.isalnum() or c in "-_" else "-" for c in user.name.lower()).strip("-")[:50]
-    channel = await guild.create_text_channel(
-        name=f"media-{safe or 'user'}",
-        category=category,
-        topic=f"media-application:{user.id}:{'plus' if paid else 'free'}",
-        overwrites=overwrites,
-        reason="Media application"
-    )
-    desc = (
-        f"👤 Заявитель: {user.mention}\n"
-        f"🎵 TikTok: {profile_url}\n"
-        f"💎 Тип: {'Media+' if paid else 'Media'}\n"
-    )
-    if payment_method:
-        desc += f"💳 Удобный способ оплаты: **{payment_method}**\n"
-    desc += "\nПроверка выполняется ботом автоматически, если TikTok отдаёт публичную статистику. Если статистика недоступна — Ticket Helper проверяет заявку вручную."
-    embed = discord.Embed(title="🎬 Заявка на Media", description=desc, color=discord.Color.blurple())
-    await channel.send(content=f"{user.mention} {'@here' if helper_role is None else helper_role.mention}", embed=embed, view=MediaReviewView())
-    return channel
 
-class MediaReviewView(discord.ui.View):
-    def __init__(self):
-        super().__init__(timeout=None)
-
-    async def _get_owner(self, interaction):
-        if not is_ticket_helper(interaction.user) and not interaction.user.guild_permissions.manage_channels and not interaction.user.guild_permissions.administrator:
-            await interaction.response.send_message("❌ Только Ticket Helper или staff.", ephemeral=True)
-            return None
-        topic = interaction.channel.topic or ""
-        if not topic.startswith("media-application:"):
-            await interaction.response.send_message("❌ Это не Media-заявка.", ephemeral=True)
-            return None
-        parts = topic.split(":")
-        try:
-            uid = int(parts[1])
-        except Exception:
-            await interaction.response.send_message("❌ Не удалось определить автора заявки.", ephemeral=True)
-            return None
-        return interaction.guild.get_member(uid)
-
-    async def _approve(self, interaction, role_name):
-        user = await self._get_owner(interaction)
-        if not user:
-            return
-        role = find_role(interaction.guild, role_name)
-        if not role:
-            return await interaction.response.send_message(f"❌ Роль `{role_name}` не найдена.", ephemeral=True)
-        try:
-            await user.add_roles(role, reason=f"Media application approved by {interaction.user}")
-        except discord.Forbidden:
-            return await interaction.response.send_message("❌ Бот не может выдать роль. Подними его роль выше Media/Media+.", ephemeral=True)
-        await interaction.response.send_message(f"✅ {user.mention} получил роль **{role_name}**.")
-        try:
-            await user.send(f"🎬 Ваша заявка одобрена. Вам выдана роль **{role_name}** на сервере **{interaction.guild.name}**.")
-        except Exception:
-            pass
-
-    @discord.ui.button(label="Одобрить Media", emoji="🎬", style=discord.ButtonStyle.success, custom_id="media:approve")
-    async def approve_media(self, interaction, button):
-        await self._approve(interaction, "Media")
-
-    @discord.ui.button(label="Одобрить Media+", emoji="💎", style=discord.ButtonStyle.primary, custom_id="media:approve_plus")
-    async def approve_plus(self, interaction, button):
-        await self._approve(interaction, "Media+")
-
-    @discord.ui.button(label="Отклонить", emoji="❌", style=discord.ButtonStyle.danger, custom_id="media:reject")
-    async def reject(self, interaction, button):
-        user = await self._get_owner(interaction)
-        if not user:
-            return
-        await interaction.response.send_message(f"❌ Заявка {user.mention} отклонена.")
-        try:
-            await user.send(f"❌ Ваша заявка на Media отклонена на сервере **{interaction.guild.name}**.")
-        except Exception:
-            pass
-
-class MediaApplicationView(discord.ui.View):
-    def __init__(self):
-        super().__init__(timeout=None)
-
-    @discord.ui.button(label="Подать на Media", emoji="🎬", style=discord.ButtonStyle.success, custom_id="media:apply_free")
-    async def free(self, interaction, button):
-        await interaction.response.send_modal(MediaApplyModal(paid=False))
-
-    @discord.ui.button(label="Подать на Media+", emoji="💎", style=discord.ButtonStyle.primary, custom_id="media:apply_plus")
-    async def plus(self, interaction, button):
-        await interaction.response.send_modal(MediaApplyModal(paid=True))
-
-class MediaApplyModal(discord.ui.Modal):
-    def __init__(self, paid=False):
-        self.paid = paid
-        super().__init__(title="Заявка на Media+" if paid else "Заявка на Media")
-        self.tiktok = discord.ui.TextInput(label="Ссылка на TikTok-профиль", placeholder="https://www.tiktok.com/@username", min_length=10, max_length=300)
-        self.add_item(self.tiktok)
-        if paid:
-            self.payment = discord.ui.TextInput(label="Удобный способ оплаты", placeholder="Например: 50кк / 35₽ / другой", min_length=2, max_length=100, required=True)
-            self.add_item(self.payment)
-
-    async def on_submit(self, interaction: discord.Interaction):
-        profile = str(self.tiktok.value).strip()
-        if "tiktok.com" not in profile.lower():
-            return await interaction.response.send_message("❌ Нужна ссылка на TikTok-профиль.", ephemeral=True)
-        payment = str(self.payment.value).strip() if self.paid else ""
-        await interaction.response.defer(ephemeral=True)
-        try:
-            views = await fetch_tiktok_views(profile)
-            tier = None
-            if views:
-                if len([v for v in views if v >= 1000]) >= 3:
-                    tier = "Media+"
-                elif len([v for v in views if v >= 500]) >= 3:
-                    tier = "Media"
-            # Заявка всегда создаёт тикет, чтобы Ticket Helper видел её.
-            channel = await create_media_ticket(interaction.guild, interaction.user, profile, self.paid, payment)
-            if tier == "Media" and not self.paid:
-                role = find_role(interaction.guild, "Media")
-                if role:
-                    await interaction.user.add_roles(role, reason="Automatic Media qualification")
-                await channel.send("🤖 Автопроверка: найдено 3 видео с 500+ просмотров. Роль **Media** выдана автоматически.")
-            elif tier == "Media+" and self.paid:
-                role = find_role(interaction.guild, "Media+")
-                if role:
-                    await interaction.user.add_roles(role, reason="Automatic Media+ qualification")
-                await channel.send("🤖 Автопроверка: найдено 3 видео с 1000+ просмотров. Роль **Media+** выдана автоматически. Указанный способ оплаты сохранён в заявке.")
-            elif tier:
-                await channel.send(f"🤖 Автопроверка нашла уровень **{tier}**, но тип заявки не совпадает. Ticket Helper проверит заявку вручную.")
-            else:
-                await channel.send("⚠️ TikTok не отдал статистику автоматически. Ticket Helper должен проверить заявку вручную.")
-            await interaction.followup.send(f"✅ Заявка создана: {channel.mention}", ephemeral=True)
-        except discord.Forbidden:
-            await interaction.followup.send("❌ Боту не хватает прав Manage Channels / Manage Roles.", ephemeral=True)
-        except Exception as e:
-            print("Media application error:", repr(e))
-            await interaction.followup.send("❌ Не удалось создать заявку. Проверь права бота.", ephemeral=True)
-
-class FAQView(discord.ui.View):
-    def __init__(self):
-        super().__init__(timeout=None)
-    @discord.ui.button(label="Media", emoji="🎬", style=discord.ButtonStyle.success, custom_id="faq:media")
-    async def media(self, interaction, button):
-        await interaction.response.send_message("🎬 Media: 3 публичных видео с 500+ просмотров. Если TikTok не отдаёт статистику, заявку проверяет Ticket Helper.", ephemeral=True)
-    @discord.ui.button(label="Media+", emoji="💎", style=discord.ButtonStyle.primary, custom_id="faq:mediaplus")
-    async def mediaplus(self, interaction, button):
-        await interaction.response.send_message("💎 Media+: 3 видео с 1000+ просмотров. В заявке указывается удобный способ оплаты.", ephemeral=True)
-    @discord.ui.button(label="Аккаунт", emoji="👤", style=discord.ButtonStyle.secondary, custom_id="faq:account")
-    async def account(self, interaction, button):
-        await interaction.response.send_message("👤 Account Manager хранит логин, дату создания и баланс. Пароль в открытом виде не показывается.", ephemeral=True)
-
-# ---------------- COMMANDS ----------------
-
-@bot.tree.command(
-    name="account",
-    description="Открыть менеджер аккаунта"
-)
-async def account(interaction: discord.Interaction):
-    embed = discord.Embed(
-        title="👤 Account Manager",
-        description=(
-            "Здесь можно создать аккаунт и посмотреть сведения о нём.\n\n"
-            "🔐 Пароль не показывается и не хранится в открытом виде."
-        ),
-        color=discord.Color.blurple()
-    )
-    await interaction.response.send_message(
-        embed=embed,
-        view=AccountInfoView()
+async def send_home(message):
+    await message.answer(
+        "🟣 <b>Alternative Media Bot</b>\n\n"
+        "Добро пожаловать в кабинет Alternative.\n"
+        "Выбери нужный раздел:",
+        reply_markup=main_kb()
     )
 
 
-@bot.tree.command(
-    name="account-info",
-    description="Показать сведения о своём аккаунте"
-)
-async def account_info(interaction: discord.Interaction):
-    account = get_account(interaction.user.id)
-
-    if not account:
-        return await interaction.response.send_message(
-            "❌ У тебя ещё нет аккаунта. Используй `/account`.",
-            ephemeral=True
-        )
-
-    _, username, _, _, created_at, balance = account
-
-    embed = discord.Embed(
-        title="👤 Твой аккаунт",
-        color=discord.Color.blurple()
-    )
-    embed.add_field(name="Логин", value=f"`{username}`", inline=False)
-    embed.add_field(name="Discord ID", value=f"`{interaction.user.id}`", inline=False)
-    embed.add_field(name="Баланс", value=f"`{balance:.2f} ₽`", inline=False)
-    embed.add_field(name="Создан", value=f"`{created_at}`", inline=False)
-    embed.add_field(
-        name="Пароль",
-        value="🔒 Скрыт.",
-        inline=False
-    )
-
-    await interaction.response.send_message(
-        embed=embed,
-        ephemeral=True
-    )
-
-
-@bot.tree.command(
-    name="ticket-panel",
-    description="Создать панель тикетов"
-)
-@app_commands.checks.has_permissions(manage_channels=True)
-async def ticket_panel(interaction: discord.Interaction):
-    embed = discord.Embed(
-        title="🎫 Alternative Client — Support",
-        description=(
-            "Выберите категорию ниже.\n\n"
-            "Бот создаст приватный тикет.\n"
-            "Есть отдельная категория **🎬 Media**."
-        ),
-        color=discord.Color.blurple()
-    )
-    embed.set_footer(text="Alternative Client")
-
-    await interaction.channel.send(
-        embed=embed,
-        view=TicketPanel()
-    )
-    await interaction.response.send_message(
-        "✅ Панель тикетов создана.",
-        ephemeral=True
-    )
-
-
-@bot.tree.command(name="media-panel", description="Создать панель заявок Media")
-@app_commands.checks.has_permissions(manage_channels=True)
-async def media_panel(interaction: discord.Interaction):
-    embed = discord.Embed(
-        title="🎬 Media",
-        description=(
-            "Подай заявку на бесплатную Media или Media+.\n\n"
-            "🆓 **Media:** 3 видео с 500+ просмотров.\n"
-            "💎 **Media+:** 3 видео с 1000+ просмотров + укажи удобный способ оплаты (например, 50кк или 35₽ за 1000 просмотров).\n\n"
-            "Если TikTok не отдаёт статистику автоматически, заявку проверит Ticket Helper."
-        ),
-        color=discord.Color.blurple()
-    )
-    await interaction.channel.send(embed=embed, view=MediaApplicationView())
-    await interaction.response.send_message("✅ Панель Media создана.", ephemeral=True)
-
-@bot.tree.command(name="faq", description="Показать FAQ сервера")
-async def faq(interaction: discord.Interaction):
-    embed = discord.Embed(
-        title="❓ FAQ",
-        description=(
-            "🎬 **Media** — бесплатная медиа при 3 видео с 500+ просмотров.\n"
-            "💎 **Media+** — 3 видео с 1000+ просмотров и условия оплаты.\n"
-            "🎫 **Тикеты** — приватные каналы, которые видит автор и роль Ticket Helper.\n"
-            "👤 **Account Manager** — аккаунт и баланс."
-        ),
-        color=discord.Color.blurple()
-    )
-    await interaction.response.send_message(embed=embed, view=FAQView(), ephemeral=True)
-
-@bot.tree.command(name="balance", description="Показать баланс Account Manager")
-async def balance(interaction: discord.Interaction):
-    if not get_account(interaction.user.id):
-        return await interaction.response.send_message("❌ Сначала создай аккаунт через `/account`.", ephemeral=True)
-    await interaction.response.send_message(f"💰 Твой баланс: **{account_balance(interaction.user.id):.2f} ₽**", ephemeral=True)
-
-@bot.tree.command(name="add-balance", description="Начислить деньги на баланс пользователю")
-@app_commands.describe(user="Пользователь", amount="Сумма в ₽")
-async def add_balance_cmd(interaction: discord.Interaction, user: discord.Member, amount: float):
-    if not (is_ticket_helper(interaction.user) or interaction.user.guild_permissions.administrator):
-        return await interaction.response.send_message("❌ Только Ticket Helper или Administrator.", ephemeral=True)
-    if amount < 0.01 or amount > 1_000_000_000:
-        return await interaction.response.send_message("❌ Сумма должна быть от 0.01 до 1 000 000 000 ₽.", ephemeral=True)
-    if not get_account(user.id):
-        return await interaction.response.send_message("❌ У пользователя нет аккаунта.", ephemeral=True)
-    add_balance(user.id, float(amount))
-    await interaction.response.send_message(f"✅ {user.mention} начислено **{amount:.2f} ₽**. Новый баланс: **{account_balance(user.id):.2f} ₽**.")
-
-@bot.tree.command(
-    name="ping",
-    description="Проверить бота"
-)
-async def ping(interaction: discord.Interaction):
-    await interaction.response.send_message(
-        f"🏓 Pong! {round(bot.latency * 1000)} ms"
-    )
-
-
-@bot.tree.command(
-    name="clear",
-    description="Удалить сообщения"
-)
-@app_commands.describe(amount="Количество сообщений: 1-100")
-@app_commands.checks.has_permissions(manage_messages=True)
-async def clear(interaction: discord.Interaction, amount: app_commands.Range[int, 1, 100]):
-    await interaction.response.defer(ephemeral=True)
-    deleted = await interaction.channel.purge(limit=amount)
-    await interaction.followup.send(
-        f"🧹 Удалено сообщений: {len(deleted)}",
-        ephemeral=True
-    )
-
-
-# ---------------- STARTUP ----------------
-
-@bot.event
-async def setup_hook():
-    # Persistent buttons/select menus continue working after restart.
-    bot.add_view(TicketPanel())
-    bot.add_view(CloseView())
-    bot.add_view(AccountInfoView())
-    bot.add_view(MediaApplicationView())
-    bot.add_view(MediaReviewView())
-    bot.add_view(FAQView())
-
+async def edit_callback(callback, text, kb):
     try:
-        await bot.tree.sync()
-        print("Slash commands synced.")
+        await callback.message.edit_text(text, reply_markup=kb)
+    except Exception:
+        await callback.message.answer(text, reply_markup=kb)
+    await callback.answer()
+
+
+@dp.message(CommandStart())
+async def start(message: Message, state: FSMContext):
+    await state.clear()
+    ensure_user(message)
+    await send_home(message)
+
+
+@dp.message(Command("menu"))
+async def menu(message: Message, state: FSMContext):
+    await state.clear()
+    ensure_user(message)
+    await send_home(message)
+
+
+@dp.message(Command("reply"))
+async def admin_reply(message: Message):
+    if not ADMIN_ID or message.from_user.id != ADMIN_ID:
+        return
+    parts = message.text.split(maxsplit=2)
+    if len(parts) < 3 or not parts[1].isdigit():
+        await message.answer("Использование: <code>/reply TELEGRAM_ID текст</code>")
+        return
+    try:
+        await bot.send_message(
+            int(parts[1]),
+            f"🆘 <b>Ответ поддержки</b>\n\n{parts[2]}"
+        )
+        await message.answer("✅ Ответ отправлен.")
     except Exception as e:
-        print("Slash command sync error:", e)
+        await message.answer(f"❌ Ошибка: <code>{e}</code>")
 
 
-@bot.event
-async def on_member_join(member: discord.Member):
-    # Automatically give every new member the "User" role.
-    if member.bot:
+@dp.message(Command("addbalance"))
+async def admin_addbalance(message: Message):
+    if not ADMIN_ID or message.from_user.id != ADMIN_ID:
+        return
+    parts = message.text.split()
+    if len(parts) != 3 or not parts[1].isdigit():
+        await message.answer("Использование: <code>/addbalance TELEGRAM_ID СУММА</code>")
+        return
+    try:
+        amount = float(parts[2].replace(",", "."))
+        add_balance(int(parts[1]), amount)
+        await message.answer(f"✅ Баланс пополнен на <b>{amount:.2f}</b>.")
+    except ValueError:
+        await message.answer("❌ Неверная сумма.")
+
+
+@dp.callback_query(F.data == "home")
+async def home(callback: CallbackQuery):
+    await edit_callback(
+        callback,
+        "🟣 <b>Alternative Media Bot</b>\n\nВыбери нужный раздел:",
+        main_kb()
+    )
+
+
+@dp.callback_query(F.data == "profile")
+async def profile(callback: CallbackQuery):
+    row = get_user(callback.from_user.id)
+    balance = row[5] if row else 0
+    discord = row[3] if row and row[3] else "не привязан"
+    role = row[4] if row else "User"
+    await edit_callback(
+        callback,
+        "👤 <b>ПРОФИЛЬ</b>\n\n"
+        f"🆔 Telegram ID: <code>{callback.from_user.id}</code>\n"
+        f"👤 Username: @{callback.from_user.username or 'нет'}\n"
+        f"🎭 Роль: <b>{role}</b>\n"
+        f"💰 Баланс: <b>{balance:.2f}</b>\n"
+        f"🔗 Discord: <b>{discord}</b>",
+        back_kb()
+    )
+
+
+@dp.callback_query(F.data == "cabinet")
+async def cabinet(callback: CallbackQuery):
+    row = get_user(callback.from_user.id)
+    balance = row[5] if row else 0
+    role = row[4] if row else "User"
+    await edit_callback(
+        callback,
+        "💼 <b>КАБИНЕТ</b>\n\n"
+        f"🎭 Статус: <b>{role}</b>\n"
+        f"💰 Баланс: <b>{balance:.2f}</b>\n\n"
+        "Здесь будет основная информация по работе с Alternative.",
+        back_kb()
+    )
+
+
+@dp.callback_query(F.data == "info")
+async def info(callback: CallbackQuery):
+    await edit_callback(
+        callback,
+        "ℹ️ <b>ИНФОРМАЦИЯ</b>\n\n"
+        "🎬 Media — статус после проверки.\n"
+        "💎 Media+ — расширенный статус.\n"
+        "💰 Оплата за принятые видео зачисляется на баланс.\n"
+        "💳 Вывод выполняется через заявку.",
+        back_kb()
+    )
+
+
+@dp.callback_query(F.data == "media")
+async def media(callback: CallbackQuery):
+    row = get_user(callback.from_user.id)
+    role = row[4] if row else "User"
+    await edit_callback(
+        callback,
+        "🎬 <b>MEDIA</b>\n\n"
+        f"Текущий статус: <b>{role}</b>\n\n"
+        "Для заявки понадобится ссылка на TikTok и привязанный Discord.",
+        media_kb()
+    )
+
+
+@dp.callback_query(F.data == "discord_link")
+async def discord_link(callback: CallbackQuery, state: FSMContext):
+    await state.set_state(Form.discord)
+    await callback.message.answer(
+        "🔗 <b>Привязка Discord</b>\n\n"
+        "Отправь числовой <b>Discord User ID</b>.\n"
+        "После этого бот проверит роль Media на сервере."
+    )
+    await callback.answer()
+
+
+@dp.message(Form.discord)
+async def process_discord(message: Message, state: FSMContext):
+    value = (message.text or "").strip()
+    if not value.isdigit():
+        await message.answer("❌ Нужен числовой Discord User ID.")
         return
 
-    role = discord.utils.get(member.guild.roles, name="User")
+    ok, status = await check_discord_media_role(value)
 
-    if role is None:
-        try:
-            role = await member.guild.create_role(
-                name="User",
-                reason="Automatic role for new members"
-            )
-        except discord.Forbidden:
-            print(f"Не удалось создать роль User на сервере {member.guild.name}: нет права Manage Roles.")
-            return
-        except discord.HTTPException as e:
-            print(f"Не удалось создать роль User на сервере {member.guild.name}: {e}")
-            return
-
-    try:
-        await member.add_roles(role, reason="Automatic User role for new member")
-        print(f"Роль User выдана: {member} на сервере {member.guild.name}")
-    except discord.Forbidden:
-        print(
-            f"Не удалось выдать роль User пользователю {member}. "
-            "Проверь: роль User должна быть ниже роли бота и у бота должно быть Manage Roles."
+    if status == "not_configured":
+        set_discord(message.from_user.id, value)
+        await state.clear()
+        await message.answer(
+            "⚠️ Discord сохранён, но автоматическая проверка роли пока не настроена.",
+            reply_markup=main_kb()
         )
-    except discord.HTTPException as e:
-        print(f"Ошибка выдачи роли User пользователю {member}: {e}")
+        return
 
+    if status == "not_found":
+        await message.answer("❌ Пользователь с таким Discord ID не найден на сервере.")
+        return
 
-@bot.event
-async def on_guild_channel_delete(channel):
-    guild = channel.guild
-    async for entry in guild.audit_logs(limit=1, action=discord.AuditLogAction.channel_delete):
-        if entry.target and entry.target.id == channel.id and isinstance(entry.user, discord.Member):
-            if await antinuke_check(guild, entry.user, "channel_delete"):
-                await antinuke_timeout(guild, entry.user, "channel_delete")
-            break
+    if not ok:
+        await message.answer(
+            "❌ Роль <b>Media</b> не найдена. Проверь, что ты на сервере и роль выдана."
+        )
+        return
 
-@bot.event
-async def on_guild_role_delete(role):
-    guild = role.guild
-    async for entry in guild.audit_logs(limit=1, action=discord.AuditLogAction.role_delete):
-        if entry.target and entry.target.id == role.id and isinstance(entry.user, discord.Member):
-            if await antinuke_check(guild, entry.user, "role_delete"):
-                await antinuke_timeout(guild, entry.user, "role_delete")
-            break
-
-@bot.event
-async def on_member_ban(guild, user):
-    async for entry in guild.audit_logs(limit=1, action=discord.AuditLogAction.ban):
-        if entry.target and entry.target.id == user.id and isinstance(entry.user, discord.Member):
-            if await antinuke_check(guild, entry.user, "ban"):
-                await antinuke_timeout(guild, entry.user, "ban")
-            break
-
-@bot.event
-async def on_member_remove(member):
-    guild = member.guild
-    await asyncio.sleep(0.5)
-    try:
-        async for entry in guild.audit_logs(limit=3, action=discord.AuditLogAction.kick):
-            if entry.target and entry.target.id == member.id and isinstance(entry.user, discord.Member):
-                if await antinuke_check(guild, entry.user, "kick"):
-                    await antinuke_timeout(guild, entry.user, "kick")
-                break
-    except Exception:
-        pass
-
-@bot.event
-async def on_ready():
-    print(f"Logged in as {bot.user} (ID: {bot.user.id})")
-
-
-if not TOKEN:
-    raise RuntimeError(
-        "Не найден DISCORD_TOKEN. Добавь токен бота в переменные окружения хостинга."
+    set_discord(message.from_user.id, value)
+    set_role(message.from_user.id, "Media")
+    await state.clear()
+    await message.answer(
+        "✅ <b>Discord привязан!</b>\n\nРоль <b>Media</b> подтверждена.",
+        reply_markup=main_kb()
     )
 
-bot.run(TOKEN)
+
+@dp.callback_query(F.data == "media_apply")
+async def media_apply(callback: CallbackQuery, state: FSMContext):
+    await state.set_state(Form.media_tiktok)
+    await callback.message.answer(
+        "🎬 <b>Заявка на Media</b>\n\n"
+        "Отправь ссылку на свой TikTok-профиль."
+    )
+    await callback.answer()
+
+
+@dp.message(Form.media_tiktok)
+async def process_media(message: Message, state: FSMContext):
+    link = (message.text or "").strip()
+    if "tiktok.com" not in link.lower():
+        await message.answer("❌ Пришли корректную ссылку на TikTok.")
+        return
+
+    row = get_user(message.from_user.id)
+    discord = row[3] if row else None
+    if not discord:
+        await state.clear()
+        await message.answer(
+            "⚠️ Сначала привяжи Discord.",
+            reply_markup=media_kb()
+        )
+        return
+
+    await state.clear()
+    await message.answer(
+        "📨 <b>Заявка отправлена.</b>\n\n"
+        f"🔗 TikTok: {link}\n"
+        f"🎮 Discord ID: <code>{discord}</code>\n\n"
+        "Заявка передана на проверку.",
+        reply_markup=main_kb()
+    )
+
+    if ADMIN_ID:
+        await bot.send_message(
+            ADMIN_ID,
+            "🎬 <b>Новая заявка Media</b>\n\n"
+            f"👤 TG: <code>{message.from_user.id}</code>\n"
+            f"🔗 TikTok: {link}\n"
+            f"🎮 Discord: <code>{discord}</code>"
+        )
+
+
+@dp.callback_query(F.data == "withdraw")
+async def withdraw(callback: CallbackQuery):
+    row = get_user(callback.from_user.id)
+    balance = row[5] if row else 0
+    await edit_callback(
+        callback,
+        "💰 <b>ВЫВОД СРЕДСТВ</b>\n\n"
+        f"Доступно: <b>{balance:.2f}</b>\n\n"
+        "Создай заявку на вывод средств.",
+        withdraw_kb()
+    )
+
+
+@dp.callback_query(F.data == "withdraw_create")
+async def withdraw_create(callback: CallbackQuery, state: FSMContext):
+    await state.set_state(Form.withdraw_amount)
+    await callback.message.answer("💳 Напиши сумму для вывода.")
+    await callback.answer()
+
+
+@dp.message(Form.withdraw_amount)
+async def withdraw_amount(message: Message, state: FSMContext):
+    try:
+        amount = float((message.text or "").replace(",", "."))
+    except ValueError:
+        await message.answer("❌ Введи сумму числом.")
+        return
+
+    row = get_user(message.from_user.id)
+    balance = float(row[5]) if row else 0
+    if amount <= 0 or amount > balance:
+        await message.answer("❌ Недопустимая сумма или недостаточно средств.")
+        return
+
+    await state.update_data(amount=amount)
+    await state.set_state(Form.withdraw_method)
+    await message.answer("💳 Напиши удобный способ оплаты.")
+
+
+@dp.message(Form.withdraw_method)
+async def withdraw_method(message: Message, state: FSMContext):
+    await state.update_data(method=(message.text or "").strip())
+    await state.set_state(Form.withdraw_details)
+    await message.answer("📝 Отправь реквизиты для выплаты.")
+
+
+@dp.message(Form.withdraw_details)
+async def withdraw_details(message: Message, state: FSMContext):
+    data = await state.get_data()
+    amount = float(data["amount"])
+    method = data["method"]
+    details = (message.text or "").strip()
+
+    con = db()
+    con.execute(
+        """INSERT INTO withdrawals
+        (telegram_id, amount, method, details, created_at)
+        VALUES (?, ?, ?, ?, ?)""",
+        (message.from_user.id, amount, method, details, datetime.utcnow().isoformat())
+    )
+    con.commit()
+    con.close()
+
+    await state.clear()
+    await message.answer(
+        "✅ <b>Заявка на вывод создана.</b>\n\n"
+        f"💰 Сумма: <b>{amount:.2f}</b>\n"
+        f"💳 Метод: <b>{method}</b>\n\n"
+        "После проверки администратор свяжется с тобой.",
+        reply_markup=main_kb()
+    )
+
+    if ADMIN_ID:
+        await bot.send_message(
+            ADMIN_ID,
+            "💰 <b>Новая заявка на вывод</b>\n\n"
+            f"👤 TG: <code>{message.from_user.id}</code>\n"
+            f"💰 Сумма: <b>{amount:.2f}</b>\n"
+            f"💳 Метод: {method}\n"
+            f"📝 Реквизиты: <code>{details}</code>"
+        )
+
+
+@dp.callback_query(F.data == "promo")
+async def promo(callback: CallbackQuery, state: FSMContext):
+    await state.set_state(Form.promo)
+    await callback.message.answer("🎁 <b>ПРОМОКОД</b>\n\nВведи промокод.")
+    await callback.answer()
+
+
+@dp.message(Form.promo)
+async def process_promo(message: Message, state: FSMContext):
+    code = (message.text or "").strip()
+    await state.clear()
+    await message.answer(
+        f"🎁 Промокод <code>{code}</code> принят на проверку.",
+        reply_markup=main_kb()
+    )
+    if ADMIN_ID:
+        await bot.send_message(
+            ADMIN_ID,
+            "🎁 <b>Введён промокод</b>\n\n"
+            f"👤 TG: <code>{message.from_user.id}</code>\n"
+            f"🏷 Код: <code>{code}</code>"
+        )
+
+
+@dp.callback_query(F.data == "referrals")
+async def referrals(callback: CallbackQuery):
+    row = get_user(callback.from_user.id)
+    code = row[6] if row else f"ALT{callback.from_user.id}"
+    await edit_callback(
+        callback,
+        "👥 <b>РЕФЕРАЛЬНАЯ ПРОГРАММА</b>\n\n"
+        f"Твой код: <code>{code}</code>\n\n"
+        "Реферальную систему можно подключить к нужным условиям начисления.",
+        back_kb()
+    )
+
+
+@dp.callback_query(F.data == "support")
+async def support(callback: CallbackQuery, state: FSMContext):
+    await state.set_state(Form.support)
+    await callback.message.answer(
+        "🆘 <b>ПОДДЕРЖКА</b>\n\n"
+        "Напиши сообщение одним сообщением — оно уйдёт администратору."
+    )
+    await callback.answer()
+
+
+@dp.message(Form.support)
+async def process_support(message: Message, state: FSMContext):
+    text = message.text or "(сообщение без текста)"
+    await state.clear()
+    await message.answer(
+        "✅ Сообщение отправлено в поддержку.\n"
+        "Ожидай ответа администратора.",
+        reply_markup=main_kb()
+    )
+
+    if ADMIN_ID:
+        await bot.send_message(
+            ADMIN_ID,
+            "🆘 <b>Новое сообщение в поддержку</b>\n\n"
+            f"👤 Telegram ID: <code>{message.from_user.id}</code>\n"
+            f"👤 Username: @{message.from_user.username or 'нет'}\n\n"
+            f"{text}\n\n"
+            f"Ответ: <code>/reply {message.from_user.id} ТЕКСТ</code>"
+        )
+
+
+@dp.message()
+async def fallback(message: Message):
+    ensure_user(message)
+    await message.answer("Используй кнопки меню 👇", reply_markup=main_kb())
+
+
+async def main():
+    init_db()
+    print("Alternative Media Bot started")
+    await dp.start_polling(bot)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
